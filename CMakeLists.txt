@@ -23,3 +23,13 @@ target_link_libraries(isotp-selftest PRIVATE Threads::Threads)
 add_executable(isotp-echo tools/isotp_echo.cpp src/CanBus.cpp src/IsoTp.cpp)
 target_include_directories(isotp-echo PRIVATE include)
 target_link_libraries(isotp-echo PRIVATE Threads::Threads)
+
+# M2：UDS 服务层的纯内存自测
+add_executable(uds-selftest tests/uds_selftest.cpp src/Uds.cpp)
+target_include_directories(uds-selftest PRIVATE include)
+target_link_libraries(uds-selftest PRIVATE Threads::Threads)
+
+# M2：虚拟 ECU + 测试仪，真在 vcan0 上对话（完整栈：CAN → ISO-TP → UDS）
+add_executable(uds-demo tools/uds_demo.cpp src/CanBus.cpp src/IsoTp.cpp src/Uds.cpp)
+target_include_directories(uds-demo PRIVATE include)
+target_link_libraries(uds-demo PRIVATE Threads::Threads)
