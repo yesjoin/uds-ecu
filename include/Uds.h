@@ -17,9 +17,13 @@
 //   0x27  SecurityAccess             种子/密钥握手（M3）
 //   0x19  ReadDTCInformation         读故障码（M3）
 //   0x14  ClearDiagnosticInformation 清故障码（M3）
+//   0x34  RequestDownload            申请下载（M4）
+//   0x36  TransferData               传输数据块（M4）
+//   0x37  RequestTransferExit        结束传输并提交（M4）
 // ============================================================================
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace uds {
@@ -43,6 +47,8 @@ enum Nrc : std::uint8_t {
     NRC_InvalidKey                   = 0x35,  // 密钥错
     NRC_ExceedNumberOfAttempts       = 0x36,  // 试太多次了
     NRC_RequiredTimeDelayNotExpired  = 0x37,  // 还在锁定冷却期
+    NRC_UploadDownloadNotAccepted    = 0x70,  // 下载申请没通过（长度/地址不合规）
+    NRC_WrongBlockSequenceCounter    = 0x73,  // 块序号不对
     NRC_ServiceNotSupportedInSession = 0x7F,  // 服务存在，但当前会话不让用
 };
 
@@ -57,6 +63,10 @@ struct UdsConfig {
     std::uint64_t s3Ms      = 5000;   // 非默认会话空闲多久自动退回默认
     std::uint16_t p2Ms      = 50;     // 写进 0x10 正响应里的 P2
     std::uint16_t p2StarMs  = 5000;   // P2*
+
+    // 已提交镜像存哪儿。空字符串 = 只放内存（进程一退就没了，适合自测）；
+    // 给个路径 = 落盘，进程被杀掉再起来，旧镜像还在 —— 断电回滚要靠它。
+    std::string   flashPath;
 };
 
 class UdsServer {
@@ -80,8 +90,18 @@ public:
     std::uint64_t requestCount()     const { return m_reqCount; }
     std::size_t   failedKeyCount()   const { return m_attempts; }
 
+    // ---- 刷写相关（M4）----
+    bool          downloadActive()   const { return m_dlActive; }
+    std::size_t   stagedSize()       const { return m_stage.size(); }   // 暂存区已收多少
+    std::size_t   imageSize()        const { return m_image.size(); }   // 已提交镜像多大
+    std::uint32_t imageCrc()         const;                             // 已提交镜像的 CRC32
+
+    // 模拟断电重启：丢弃还没提交的暂存区，已提交的镜像保持不变。
+    // 真实场景里这一步由"上电自检"完成 —— 发现暂存区不完整就作废。
+    void          reboot();
+
 private:
-    // 七个服务的实现，各自"先查长度再干活"
+    // 十个服务的实现，各自"先查长度再干活"
     std::vector<std::uint8_t> svcSessionControl(const std::vector<std::uint8_t>& req,
                                                 std::uint64_t nowMs);
     std::vector<std::uint8_t> svcReadDid(const std::vector<std::uint8_t>& req);
@@ -92,9 +112,16 @@ private:
                                                 std::uint64_t nowMs);
     std::vector<std::uint8_t> svcReadDtc(const std::vector<std::uint8_t>& req);
     std::vector<std::uint8_t> svcClearDtc(const std::vector<std::uint8_t>& req);
+    std::vector<std::uint8_t> svcRequestDownload(const std::vector<std::uint8_t>& req);
+    std::vector<std::uint8_t> svcTransferData(const std::vector<std::uint8_t>& req);
+    std::vector<std::uint8_t> svcTransferExit(const std::vector<std::uint8_t>& req);
 
     void        setSession(Session s, std::uint64_t nowMs);
     std::size_t countDtcWithMask(std::uint8_t mask) const;
+
+    // 镜像落盘（flashPath 为空时这两个是空操作）
+    void        loadImage();
+    void        saveImage();
 
     UdsConfig     m_cfg;
     Session       m_session   = Session::Default;
@@ -111,6 +138,17 @@ private:
 
     // ---- 0x19 / 0x14 的故障码表 ----
     std::vector<Dtc> m_dtcs;
+
+    // ---- 刷写状态（M4）----
+    //   m_image：已经正式提交的镜像（掉电也不会丢的那一份）
+    //   m_stage：正在收的暂存区（只有 0x37 成功才升级成 m_image）
+    //   两块分开存，就是"写到一半断电不会毁掉旧版本"的全部秘密。
+    bool                      m_dlActive        = false;
+    std::uint32_t             m_dlAddress       = 0;
+    std::uint32_t             m_dlDeclaredSize  = 0;
+    std::uint8_t              m_dlNextBlock     = 1;
+    std::vector<std::uint8_t> m_stage;
+    std::vector<std::uint8_t> m_image;
 };
 
 } // namespace uds

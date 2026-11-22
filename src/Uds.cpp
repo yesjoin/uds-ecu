@@ -1,6 +1,7 @@
 #include "Uds.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <string>
 
 namespace uds {
@@ -53,6 +54,19 @@ DidSlot* findDid(std::uint16_t id) {
     return nullptr;
 }
 
+// 标准 CRC-32（多项式 0xEDB88320）。用来判断"收上来的镜像是不是完整的一份"。
+// 校验值可以自查：字符串 "123456789" 的 CRC32 是 0xCBF43926。
+std::uint32_t crc32Of(const std::vector<std::uint8_t>& v) {
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (auto b : v) {
+        crc ^= b;
+        for (int i = 0; i < 8; ++i) {
+            crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 } // namespace
 
 UdsServer::UdsServer(UdsConfig cfg) : m_cfg(cfg) {
@@ -64,6 +78,11 @@ UdsServer::UdsServer(UdsConfig cfg) : m_cfg(cfg) {
         {0x0A1202, 0x08},   // 已确认故障
         {0x7A1203, 0x01},   // 本次失败，还没确认
     };
+
+    // 上电自检：把上次已经"提交"过的镜像读回来。
+    // 注意只读正式镜像，暂存区压根不存在磁盘上 —— 所以断电之后
+    // 磁盘里要么是上一版、要么是这一版，从来没有"半个版本"。
+    loadImage();
 }
 
 void UdsServer::setSession(Session s, std::uint64_t nowMs) {
@@ -106,6 +125,9 @@ std::vector<std::uint8_t> UdsServer::handle(const std::vector<std::uint8_t>& req
         case 0x27: return svcSecurityAccess(req, nowMs);
         case 0x19: return svcReadDtc(req);
         case 0x14: return svcClearDtc(req);
+        case 0x34: return svcRequestDownload(req);
+        case 0x36: return svcTransferData(req);
+        case 0x37: return svcTransferExit(req);
         default:   return neg(req[0], NRC_ServiceNotSupported);
     }
 }
@@ -356,6 +378,169 @@ std::vector<std::uint8_t> UdsServer::svcClearDtc(const std::vector<std::uint8_t>
         return Bytes{0x54};                // 只回"清完了"，不回数据
     }
     return neg(0x14, NRC_RequestOutOfRange);
+}
+
+std::uint32_t UdsServer::imageCrc() const {
+    return crc32Of(m_image);
+}
+
+void UdsServer::loadImage() {
+    if (m_cfg.flashPath.empty()) return;      // 纯内存模式
+
+    std::FILE* f = std::fopen(m_cfg.flashPath.c_str(), "rb");
+    if (f == nullptr) return;                 // 这车还没刷过，正常
+
+    Bytes        buf;
+    std::uint8_t chunk[4096];
+    std::size_t  n = 0;
+    while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        buf.insert(buf.end(), chunk, chunk + n);
+    }
+    std::fclose(f);
+    m_image = buf;
+}
+
+void UdsServer::saveImage() {
+    if (m_cfg.flashPath.empty()) return;      // 纯内存模式
+
+    // 先写 .tmp，写完再 rename。
+    // 同一个文件系统里 rename 是原子的：任何一刻掉电，
+    // 目录指向的要么还是旧文件、要么已经是新文件，绝不会是半截文件。
+    // 这就是"刷写到一半断电不会变砖"的技术根子，不是靠运气。
+    const std::string tmp = m_cfg.flashPath + ".tmp";
+
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return;
+    if (!m_image.empty()) {
+        std::fwrite(m_image.data(), 1, m_image.size(), f);
+    }
+    std::fflush(f);
+    std::fclose(f);
+
+    std::rename(tmp.c_str(), m_cfg.flashPath.c_str());
+}
+
+void UdsServer::reboot() {
+    // 上电自检：暂存区里的东西没有"提交"过，一律作废。
+    // 这就是断电回滚的全部原理 —— 旧镜像从来没被动过。
+    m_stage.clear();
+    m_dlActive       = false;
+    m_dlNextBlock    = 1;
+    m_dlDeclaredSize = 0;
+    m_dlAddress      = 0;
+    setSession(Session::Default, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 0x34 申请下载
+//   请求：34 <dataFormatIdentifier> <ALFID> <地址...> <长度...>
+//         ALFID 高 4 位 = 地址占几字节，低 4 位 = 长度占几字节
+//   正响：74 <LFI> <maxNumberOfBlockLength>
+//
+//   两道门：编程会话 + 已解锁。刷写是整条诊断链里权限最高的事。
+// ---------------------------------------------------------------------------
+std::vector<std::uint8_t> UdsServer::svcRequestDownload(
+        const std::vector<std::uint8_t>& req) {
+    if (req.size() < 4) return neg(0x34, NRC_IncorrectLength);
+
+    if (m_session != Session::Programming) {
+        return neg(0x34, NRC_ServiceNotSupportedInSession);
+    }
+    if (!m_unlocked) {
+        return neg(0x34, NRC_SecurityDenied);
+    }
+
+    const std::uint8_t fmt   = req[1];
+    const std::uint8_t alfid = req[2];
+
+    if (fmt != 0x00) return neg(0x34, NRC_RequestOutOfRange);   // 只支持不压缩不加密
+
+    const std::uint8_t addrLen = static_cast<std::uint8_t>((alfid >> 4) & 0x0F);
+    const std::uint8_t sizeLen = static_cast<std::uint8_t>(alfid & 0x0F);
+
+    if (addrLen < 1 || addrLen > 4 || sizeLen < 1 || sizeLen > 4) {
+        return neg(0x34, NRC_IncorrectLength);
+    }
+    if (req.size() != static_cast<std::size_t>(3 + addrLen + sizeLen)) {
+        return neg(0x34, NRC_IncorrectLength);
+    }
+
+    std::uint32_t addr = 0;
+    for (std::size_t i = 3; i < 3 + static_cast<std::size_t>(addrLen); ++i) {
+        addr = (addr << 8) | req[i];
+    }
+
+    std::uint32_t size = 0;
+    for (std::size_t i = 3 + addrLen; i < req.size(); ++i) size = (size << 8) | req[i];
+
+    if (size == 0 || size > 65536u) {
+        return neg(0x34, NRC_UploadDownloadNotAccepted);
+    }
+
+    m_dlActive       = true;
+    m_dlAddress      = addr;
+    m_dlDeclaredSize = size;
+    m_dlNextBlock    = 1;
+    m_stage.clear();
+    m_stage.reserve(size);
+
+    // 74 <LFI> <maxNumberOfBlockLength>
+    // LFI 的低 4 位 = 这个长度值占几个字节；这里给 2 字节，值是 256
+    return Bytes{0x74, 0x02, 0x01, 0x00};
+}
+
+// ---------------------------------------------------------------------------
+// 0x36 传数据块
+//   请求：36 <块序号> <数据...>
+//   正响：76 <块序号>
+//
+//   块序号从 1 开始，0xFF 之后回到 0x00。错一个就整包拒 ——
+//   这是防"丢了一块但没发现"的唯一手段。
+// ---------------------------------------------------------------------------
+std::vector<std::uint8_t> UdsServer::svcTransferData(
+        const std::vector<std::uint8_t>& req) {
+    if (req.size() < 3) return neg(0x36, NRC_IncorrectLength);
+    if (!m_dlActive)    return neg(0x36, NRC_RequestSequenceError);   // 没申请就传
+
+    const std::uint8_t seq = req[1];
+    if (seq != m_dlNextBlock) {
+        return neg(0x36, NRC_WrongBlockSequenceCounter);
+    }
+
+    const std::size_t n = req.size() - 2;
+    if (m_stage.size() + n > m_dlDeclaredSize) {
+        return neg(0x36, NRC_RequestOutOfRange);   // 超出 0x34 声明的总长度
+    }
+
+    m_stage.insert(m_stage.end(), req.begin() + 2, req.end());
+    m_dlNextBlock = (seq == 0xFF) ? 0x00 : static_cast<std::uint8_t>(seq + 1);
+
+    return Bytes{0x76, seq};
+}
+
+// ---------------------------------------------------------------------------
+// 0x37 结束传输
+//   请求：37
+//   正响：77
+//
+//   只有"收够了声明长度"才提交。没收够就拒绝 ——
+//   暂存区留在那儿，但永远升不成正式镜像。
+// ---------------------------------------------------------------------------
+std::vector<std::uint8_t> UdsServer::svcTransferExit(
+        const std::vector<std::uint8_t>& req) {
+    if (req.size() != 1)  return neg(0x37, NRC_IncorrectLength);
+    if (!m_dlActive)      return neg(0x37, NRC_RequestSequenceError);
+
+    if (m_stage.size() != m_dlDeclaredSize) {
+        return neg(0x37, NRC_UploadDownloadNotAccepted);   // 还没收全，不许提交
+    }
+
+    m_image     = m_stage;        // 提交：暂存区升级为正式镜像
+    saveImage();                  // 落盘（tmp → rename 原子替换）
+    m_stage.clear();
+    m_dlActive  = false;
+    m_dlNextBlock = 1;
+    return Bytes{0x77};
 }
 
 void UdsServer::tick(std::uint64_t nowMs) {

@@ -321,10 +321,192 @@ void testDtc() {
            ecu.handle(Bytes{0x19, 0x03, 0xFF}, 0), Bytes{0x7F, 0x19, 0x12});
 }
 
+// ---------------------------------------------------------------------------
+// M4：0x34 / 0x36 / 0x37 刷写
+// ---------------------------------------------------------------------------
+Bytes reqDownload(std::uint32_t addr, std::uint32_t size) {
+    return Bytes{0x34, 0x00, 0x44,                        // 不压缩 / 地址 4 字节 / 长度 4 字节
+                 static_cast<std::uint8_t>((addr >> 24) & 0xFF),
+                 static_cast<std::uint8_t>((addr >> 16) & 0xFF),
+                 static_cast<std::uint8_t>((addr >> 8) & 0xFF),
+                 static_cast<std::uint8_t>(addr & 0xFF),
+                 static_cast<std::uint8_t>((size >> 24) & 0xFF),
+                 static_cast<std::uint8_t>((size >> 16) & 0xFF),
+                 static_cast<std::uint8_t>((size >> 8) & 0xFF),
+                 static_cast<std::uint8_t>(size & 0xFF)};
+}
+
+void unlockEcu(uds::UdsServer& ecu, std::uint64_t now) {
+    const Bytes sf = ecu.handle(Bytes{0x27, 0x01}, now);
+    ecu.handle(keyReq(uds::UdsServer::computeKey(seedOf(sf))), now);
+}
+
+void testFlashGates() {
+    uds::UdsServer ecu;
+
+    expect("0x36：没申请下载就传 → 7F 36 24（顺序错）",
+           ecu.handle(Bytes{0x36, 0x01, 0x11}, 0), Bytes{0x7F, 0x36, 0x24});
+
+    expect("0x34：默认会话申请下载 → 7F 34 7F",
+           ecu.handle(reqDownload(0x08000000u, 100), 0), Bytes{0x7F, 0x34, 0x7F});
+
+    ecu.handle(Bytes{0x10, 0x02}, 0);                     // 进编程会话
+    expect("0x34：编程会话但没解锁 → 7F 34 33",
+           ecu.handle(reqDownload(0x08000000u, 100), 0), Bytes{0x7F, 0x34, 0x33});
+
+    unlockEcu(ecu, 0);
+    expect("0x34：会话 + 解锁齐了 → 74 02 01 00（每块最多 256 字节）",
+           ecu.handle(reqDownload(0x08000000u, 100), 0), Bytes{0x74, 0x02, 0x01, 0x00});
+}
+
+void testFlashGates2() {
+    uds::UdsServer ecu;
+    ecu.handle(Bytes{0x10, 0x02}, 0);
+    unlockEcu(ecu, 0);
+
+    expect("0x34：声明长度 0 → 7F 34 70",
+           ecu.handle(reqDownload(0x08000000u, 0), 0), Bytes{0x7F, 0x34, 0x70});
+
+    expect("0x34：压缩/加密格式不支持 → 7F 34 31",
+           ecu.handle(Bytes{0x34, 0x01, 0x44, 0, 0, 0, 0, 0, 0, 0, 100}, 0),
+           Bytes{0x7F, 0x34, 0x31});
+
+    ecu.handle(reqDownload(0x08000000u, 20), 0);
+    Bytes tooBig{0x36, 0x01};
+    for (int i = 0; i < 21; ++i) tooBig.push_back(static_cast<std::uint8_t>(i));
+    expect("0x36：单块超过声明总长 → 7F 36 31",
+           ecu.handle(tooBig, 0), Bytes{0x7F, 0x36, 0x31});
+}
+
+void testFlashHappyPath() {
+    uds::UdsServer ecu;
+    ecu.handle(Bytes{0x10, 0x02}, 0);
+    unlockEcu(ecu, 0);
+    check(ecu.handle(reqDownload(0x08000000u, 100), 0)[0] == 0x74, "0x34：申请成功");
+
+    Bytes b1{0x36, 0x01};                                  // 第 1 块：64 字节
+    for (int i = 0; i < 64; ++i) b1.push_back(static_cast<std::uint8_t>(i & 0xFF));
+    expect("0x36：第 1 块 → 76 01", ecu.handle(b1, 0), Bytes{0x76, 0x01});
+    check(ecu.stagedSize() == 64, "0x36：暂存区已收 64 字节");
+
+    expect("0x36：块序号乱跳（发 3）→ 7F 36 73",
+           ecu.handle(Bytes{0x36, 0x03, 0x11}, 0), Bytes{0x7F, 0x36, 0x73});
+
+    expect("0x37：只收了 64/100 就想结束 → 7F 37 70",
+           ecu.handle(Bytes{0x37}, 0), Bytes{0x7F, 0x37, 0x70});
+    check(ecu.imageSize() == 0, "0x37：没收全绝不提交（正式镜像仍是空的）");
+
+    Bytes b2{0x36, 0x02};                                  // 第 2 块：剩下 36 字节
+    for (int i = 64; i < 100; ++i) b2.push_back(static_cast<std::uint8_t>(i & 0xFF));
+    expect("0x36：第 2 块 → 76 02", ecu.handle(b2, 0), Bytes{0x76, 0x02});
+
+    expect("0x37：收全了 → 77（提交）", ecu.handle(Bytes{0x37}, 0), Bytes{0x77});
+    check(ecu.imageSize() == 100, "0x37：镜像已提交，100 字节");
+    check(!ecu.downloadActive(), "0x37：下载状态已复位");
+}
+
+void testFlashRollback() {
+    uds::UdsServer ecu;
+    ecu.handle(Bytes{0x10, 0x02}, 0);
+    unlockEcu(ecu, 0);
+
+    // 先刷一版好的，作为"旧镜像"
+    ecu.handle(reqDownload(0x08000000u, 50), 0);
+    Bytes ok{0x36, 0x01};
+    for (int i = 0; i < 50; ++i) ok.push_back(static_cast<std::uint8_t>(i & 0xFF));
+    ecu.handle(ok, 0);
+    ecu.handle(Bytes{0x37}, 0);
+
+    const std::size_t  goodSize = ecu.imageSize();
+    const std::uint32_t goodCrc = ecu.imageCrc();
+    check(goodSize == 50, "回滚：先有一份完好的旧镜像（50 字节）");
+
+    // 再刷一版，刷到一半"断电"
+    ecu.handle(Bytes{0x10, 0x02}, 0);
+    unlockEcu(ecu, 0);
+    ecu.handle(reqDownload(0x08000000u, 50), 0);
+    Bytes half{0x36, 0x01};
+    for (int i = 0; i < 20; ++i) half.push_back(0xAA);
+    ecu.handle(half, 0);
+    check(ecu.stagedSize() == 20, "回滚：新版本只收到了 20/50 字节");
+
+    ecu.reboot();                                          // 断电重启
+
+    check(!ecu.downloadActive(), "回滚：重启后下载状态清空");
+    check(ecu.stagedSize() == 0, "回滚：重启后暂存区被丢弃");
+    check(ecu.imageSize() == goodSize && ecu.imageCrc() == goodCrc,
+          "回滚：旧镜像完好，大小和 CRC 都没变");
+
+    expect("回滚：重启后想接着 0x37 → 7F 37 24（没有活动下载）",
+           ecu.handle(Bytes{0x37}, 0), Bytes{0x7F, 0x37, 0x24});
+}
+
+void testFlashCrc() {
+    uds::UdsServer ecu;
+    ecu.handle(Bytes{0x10, 0x02}, 0);
+    unlockEcu(ecu, 0);
+
+    const Bytes nine = ascii("123456789");
+    ecu.handle(reqDownload(0x08000000u, 9), 0);
+
+    Bytes b{0x36, 0x01};
+    for (auto c : nine) b.push_back(c);
+    ecu.handle(b, 0);
+    ecu.handle(Bytes{0x37}, 0);
+
+    // 这是 CRC-32 的标准自查值，任何实现算 "123456789" 都必须是它
+    check(ecu.imageCrc() == 0xCBF43926u,
+          "刷写：123456789 的 CRC32 = 0xCBF43926（标准校验值对上了）");
+}
+
+// 落盘版：进程死掉再起来，旧镜像必须还在 —— 这才是真的"断电"
+void testFlashPersist() {
+    const std::string path = "/tmp/uds_selftest_image.bin";
+    std::remove(path.c_str());
+
+    uds::UdsConfig cfg;
+    cfg.flashPath = path;
+
+    {
+        uds::UdsServer ecu(cfg);                     // 第 1 次上电
+        ecu.handle(Bytes{0x10, 0x02}, 0);
+        unlockEcu(ecu, 0);
+        ecu.handle(reqDownload(0x08000000u, 32), 0);
+        Bytes b{0x36, 0x01};
+        for (int i = 0; i < 32; ++i) b.push_back(static_cast<std::uint8_t>(i));
+        ecu.handle(b, 0);
+        ecu.handle(Bytes{0x37}, 0);
+        check(ecu.imageSize() == 32, "落盘：第一版 32 字节提交成功");
+    }                                                // 对象销毁 = 断电
+
+    {
+        uds::UdsServer ecu(cfg);                     // 第 2 次上电：从磁盘读回
+        check(ecu.imageSize() == 32, "落盘：重启后磁盘里的旧镜像还在（32 字节）");
+        check(ecu.imageCrc() != 0, "落盘：重启后 CRC 也重新算得出来");
+
+        // 再刷一版，只传了 10/64 字节就断电
+        ecu.handle(Bytes{0x10, 0x02}, 0);
+        unlockEcu(ecu, 0);
+        ecu.handle(reqDownload(0x08000000u, 64), 0);
+        Bytes half{0x36, 0x01};
+        for (int i = 0; i < 10; ++i) half.push_back(0xAA);
+        ecu.handle(half, 0);
+        check(ecu.stagedSize() == 10, "落盘：这一版只收到了 10/64 字节");
+    }                                                // 半截就断电
+
+    {
+        uds::UdsServer ecu(cfg);                     // 第 3 次上电
+        check(ecu.imageSize() == 32,
+              "落盘：半截的那次没污染磁盘，旧镜像还是 32 字节");
+    }
+
+    std::remove(path.c_str());
+}
+
 } // namespace
 
 int main() {
-    std::printf("=== UDS 服务层自测（M2 + M3）===\n\n");
+    std::printf("=== UDS 服务层自测（M2 + M3 + M4）===\n\n");
 
     testSessionControl();
     testReadDid();
@@ -335,9 +517,15 @@ int main() {
     testSecurityLockout();
     testProtectedWrite();
     testDtc();
+    testFlashGates();
+    testFlashGates2();
+    testFlashHappyPath();
+    testFlashRollback();
+    testFlashCrc();
+    testFlashPersist();
 
     std::printf("\n--------------------------------\n");
     std::printf("通过 %d 项，失败 %d 项\n", gPass, gFail);
-    if (gFail == 0) std::printf("M3 全绿 —— 服务层从能读能写，进到有门槛了。\n");
+    if (gFail == 0) std::printf("M4 全绿 —— 能刷写了，而且断电不会把 ECU 刷成砖。\n");
     return (gFail == 0) ? 0 : 1;
 }

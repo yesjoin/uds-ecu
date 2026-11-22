@@ -1,5 +1,5 @@
 // ============================================================================
-// uds_demo.cpp —— M2/M3：把 UDS 服务层架到 vcan0 上
+// uds_demo.cpp —— M2/M3/M4：把 UDS 服务层架到 vcan0 上
 //
 // 用法（两个终端）：
 //   T1: ./build/uds-demo --ecu --wait-s 120            # 虚拟 ECU 待命
@@ -11,6 +11,7 @@
 //       ./build/uds-demo --tester "19 02 FF"           # 列出全部故障码
 //       ./build/uds-demo --tester "19 01 08"           # 只数"已确认"的故障码
 //       ./build/uds-demo --tester "14 FF FF FF"        # 清故障码
+//       ./build/uds-demo --flash 400                   # 刷 400 字节（34/36/37 全链）
 //
 //   T3: candump vcan0                                  # 看总线
 // ============================================================================
@@ -19,12 +20,14 @@
 #include "IsoTp.h"
 #include "Uds.h"
 
+#include <csignal>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -184,7 +187,8 @@ void interpret(const Bytes& msg) {
 // ---------------------------------------------------------------------------
 // ECU 侧：等请求、答响应
 // ---------------------------------------------------------------------------
-int runEcu(const std::string& iface, int waitSec) {
+int runEcu(const std::string& iface, int waitSec,
+           const std::string& flashPath, int dieAfterBlock) {
     uds::CanBus bus(iface);
     if (!bus.ok()) {
         std::fprintf(stderr, "[ecu] 打不开 %s\n", iface.c_str());
@@ -197,18 +201,25 @@ int runEcu(const std::string& iface, int waitSec) {
 
     uds::IsoTp    rx(cfg);
     uds::IsoTpTx  tx(cfg);
-    uds::UdsServer ecu;
+
+    uds::UdsConfig ucfg;
+    ucfg.flashPath = flashPath;                 // 空 = 只放内存
+    uds::UdsServer ecu(ucfg);
 
     std::printf("[ecu] 就绪：监听 0x%03X，应答 0x%03X，待命 %d 秒\n",
                 TESTER_TX, ECU_TX, waitSec);
     std::printf("[ecu] 服务：10 会话 / 22 读DID / 2E 写DID / 27 安全访问 / "
-                "19 读故障码 / 14 清故障码 / 3E 保活\n");
+                "19 读故障码 / 14 清故障码 / 3E 保活 / 34+36+37 刷写\n");
+    std::printf("[ecu] 镜像：%s，当前 %zu 字节\n",
+                flashPath.empty() ? "内存（进程一退就没了）" : flashPath.c_str(),
+                ecu.imageSize());
 
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(waitSec);
 
     bool  txActive = false;
     Bytes msg;
+    int   blocksSeen = 0;
 
     while (std::chrono::steady_clock::now() < deadline) {
         uds::Frame f;
@@ -231,6 +242,18 @@ int runEcu(const std::string& iface, int waitSec) {
                         txActive = true;
                     }
                 }
+
+                // 拔电源模拟：处理到第 N 个 0x36 之后立刻死掉，
+                // 缓冲不刷新、退出码 9，跟真断电一样不留遗言
+                if (!msg.empty() && msg[0] == 0x36) {
+                    ++blocksSeen;
+                    if (dieAfterBlock > 0 && blocksSeen >= dieAfterBlock) {
+                        std::printf("[ecu] *** 拔电源 *** 收到第 %d 块就断，"
+                                    "镜像没提交\n", blocksSeen);
+                        std::fflush(stdout);
+                        ::kill(::getpid(), SIGKILL);
+                    }
+                }
             }
 
             if (rx.needFlowControl()) {
@@ -251,11 +274,12 @@ int runEcu(const std::string& iface, int waitSec) {
     }
 
     std::printf("\n[ecu] 待命结束：处理 %llu 条请求，会话 = 0x%02X，解锁状态 = %s，"
-                "故障码 %zu 条\n",
+                "故障码 %zu 条，镜像 %zu 字节\n",
                 static_cast<unsigned long long>(ecu.requestCount()),
                 static_cast<unsigned>(ecu.session()),
                 ecu.securityUnlocked() ? "已解锁" : "已锁定",
-                ecu.dtcCount());
+                ecu.dtcCount(),
+                ecu.imageSize());
     return 0;
 }
 
@@ -352,14 +376,113 @@ int runUnlock(const std::string& iface, int waitSec) {
     return (resp.size() >= 2 && resp[0] == 0x67 && resp[1] == 0x02) ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// 刷写：10 02 → 27 解锁 → 34 申请 → 36 分块传 → 37 提交
+//   total 字节的数据用 64 字节一块发出去，正好能看清 ISO-TP 多帧 + 流控
+// ---------------------------------------------------------------------------
+int runFlash(const std::string& iface, std::uint32_t total, int waitSec) {
+    uds::CanBus bus(iface);
+    if (!bus.ok()) {
+        std::fprintf(stderr, "[tester] 打不开 %s\n", iface.c_str());
+        return 1;
+    }
+
+    uds::IsoTpConfig cfg;
+    cfg.rxId      = ECU_TX;
+    cfg.txId      = TESTER_TX;
+    cfg.blockSize = 8;
+    cfg.stMinMs   = 0;
+
+    uds::IsoTp   rx(cfg);
+    uds::IsoTpTx tx(cfg);
+
+    // 发一条请求、等一条正响应（首字节 = 请求 SID + 0x40）
+    auto send = [&](const Bytes& req, Bytes& resp, const char* what) -> bool {
+        printHex("[tester] -> 请求", req);
+        if (!transact(bus, rx, tx, cfg.rxId, req, resp,
+                      static_cast<std::uint64_t>(waitSec) * 1000)) {
+            std::printf("[tester] %s 没响应（%d 秒超时）\n", what, waitSec);
+            return false;
+        }
+        printHex("[tester] <- 响应", resp);
+        if (resp.empty() ||
+            resp[0] != static_cast<std::uint8_t>(req[0] + 0x40)) {
+            interpret(resp);
+            std::printf("[tester] %s 被拒\n", what);
+            return false;
+        }
+        return true;
+    };
+
+    Bytes resp;
+
+    // 1) 进编程会话 —— 刷写只在 0x02 会话里允许
+    if (!send(Bytes{0x10, 0x02}, resp, "切编程会话")) return 1;
+    std::printf("[tester] 已进入编程会话\n\n");
+
+    // 2) 安全访问
+    if (!send(Bytes{0x27, 0x01}, resp, "要种子")) return 1;
+    const std::uint32_t seed = seedOf(resp);
+    const std::uint32_t key  = uds::UdsServer::computeKey(seed);
+    std::printf("[tester] 种子 0x%08X → 密钥 0x%08X\n", seed, key);
+    if (!send(keyReq(key), resp, "送密钥")) return 1;
+    std::printf("[tester] 已解锁\n\n");
+
+    // 3) 0x34 申请下载：34 00 44 <地址 4 字节> <长度 4 字节>
+    Bytes dl{0x34, 0x00, 0x44,
+             0x08, 0x00, 0x00, 0x00,
+             static_cast<std::uint8_t>((total >> 24) & 0xFF),
+             static_cast<std::uint8_t>((total >> 16) & 0xFF),
+             static_cast<std::uint8_t>((total >> 8) & 0xFF),
+             static_cast<std::uint8_t>(total & 0xFF)};
+    if (!send(dl, resp, "申请下载")) return 1;
+    std::printf("[tester] 申请下载 %u 字节成功\n\n", total);
+
+    // 4) 0x36 分块传
+    std::vector<std::uint8_t> pattern(total);
+    for (std::uint32_t i = 0; i < total; ++i) {
+        pattern[i] = static_cast<std::uint8_t>((i * 7u + 3u) & 0xFF);
+    }
+
+    const std::uint32_t chunk = 64;
+    std::uint8_t  seq  = 1;
+    std::uint32_t sent = 0;
+    const std::uint64_t t0 = uds::steadyMs();
+
+    while (sent < total) {
+        const std::uint32_t left = total - sent;
+        const std::uint32_t n    = (left < chunk) ? left : chunk;
+
+        Bytes blk{0x36, seq};
+        blk.insert(blk.end(), pattern.begin() + sent, pattern.begin() + sent + n);
+
+        if (!send(blk, resp, "传数据块")) return 1;
+        std::printf("[tester]   块 %02X 传 %u 字节（累计 %u/%u）\n", seq, n, sent + n, total);
+
+        sent += n;
+        seq = static_cast<std::uint8_t>(seq + 1);   // 0xFF 之后自然回到 0x00
+    }
+
+    const std::uint64_t dt = uds::steadyMs() - t0;
+    std::printf("[tester] 全部传完，耗时 %llu ms\n\n", static_cast<unsigned long long>(dt));
+
+    // 5) 0x37 结束并提交
+    if (!send(Bytes{0x37}, resp, "结束传输")) return 1;
+    std::printf("[tester] 提交成功 —— 新镜像落定，旧镜像被替换\n");
+    return 0;
+}
+
 void usage() {
     std::printf(
         "用法：\n"
-        "  uds-demo --ecu [--iface vcan0] [--wait-s 120]\n"
+        "  uds-demo --ecu [--iface vcan0] [--wait-s 120] [--flash-file <路径>] [--die-after N]\n"
         "  uds-demo --tester \"22 F1 90\" [--iface vcan0] [--wait-s 5]\n"
         "  uds-demo --unlock [--iface vcan0] [--wait-s 5]\n"
+        "  uds-demo --flash 400 [--iface vcan0] [--wait-s 5]\n"
         "\n"
-        "  0x27 安全访问在默认会话下不给种子，--unlock 会自动先切扩展会话。\n");
+        "  0x27 安全访问在默认会话下不给种子，--unlock 会自动先切扩展会话。\n"
+        "  --flash N 走完整刷写链：10 02 → 27 → 34 → 36×N → 37，N 是总字节数。\n"
+        "  --flash-file 让 ECU 把已提交的镜像落盘；--die-after N 模拟收到第 N 块就断电。\n");
 }
 
 } // namespace
@@ -370,6 +493,9 @@ int main(int argc, char** argv) {
     bool        ecuMode  = false;
     bool        unlockMode = false;
     int         waitSec  = 0;
+    int         flashBytes = 0;
+    std::string flashFile;
+    int         dieAfter = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -377,6 +503,12 @@ int main(int argc, char** argv) {
             ecuMode = true;
         } else if (a == "--unlock") {
             unlockMode = true;
+        } else if (a == "--flash" && i + 1 < argc) {
+            flashBytes = std::atoi(argv[++i]);
+        } else if (a == "--flash-file" && i + 1 < argc) {
+            flashFile = argv[++i];
+        } else if (a == "--die-after" && i + 1 < argc) {
+            dieAfter = std::atoi(argv[++i]);
         } else if (a == "--tester" && i + 1 < argc) {
             reqStr = argv[++i];
         } else if (a == "--iface" && i + 1 < argc) {
@@ -390,13 +522,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    const int modes = (ecuMode ? 1 : 0) + (unlockMode ? 1 : 0) + (reqStr.empty() ? 0 : 1);
+    const int modes = (ecuMode ? 1 : 0) + (unlockMode ? 1 : 0) +
+                      (reqStr.empty() ? 0 : 1) + (flashBytes > 0 ? 1 : 0);
     if (modes != 1) {
         usage();
         return 2;
     }
 
-    if (ecuMode)    return runEcu(iface, waitSec > 0 ? waitSec : 120);
+    if (ecuMode) {
+        return runEcu(iface, waitSec > 0 ? waitSec : 120, flashFile, dieAfter);
+    }
     if (unlockMode) return runUnlock(iface, waitSec > 0 ? waitSec : 5);
+    if (flashBytes > 0) {
+        return runFlash(iface, static_cast<std::uint32_t>(flashBytes),
+                        waitSec > 0 ? waitSec : 5);
+    }
     return runTester(iface, parseHex(reqStr), waitSec > 0 ? waitSec : 5);
 }
