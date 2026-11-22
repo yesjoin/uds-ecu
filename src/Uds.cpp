@@ -32,8 +32,8 @@ struct DidSlot {
 
 // DID 表。static 只初始化一次：0x2E 写进来的值会一直留在这里，
 // 于是"写进去 → 再读回来"能形成闭环验证。
-std::vector<DidSlot>& dids() {
-    static std::vector<DidSlot> table = {
+std::vector<DidSlot> factoryDids() {
+    return {
         {0xF186, false, Bytes{0x01}},                       // 当前会话（随会话变）
         {0xF187, false, ascii("1234567890A")},              // 零件号
         {0xF188, false, ascii("SW01.02.03")},               // 软件版本
@@ -44,6 +44,10 @@ std::vector<DidSlot>& dids() {
         {0x0101, true,  Bytes{0x0E, 0x74}},                 // 自定义：电压 37.00V
         {0x0200, true,  Bytes{0x00, 0x00, 0x0F, 0xA0}, true},  // 里程：写之前要解锁
     };
+}
+
+std::vector<DidSlot>& dids() {
+    static std::vector<DidSlot> table = factoryDids();
     return table;
 }
 
@@ -108,6 +112,10 @@ std::uint32_t UdsServer::computeKey(std::uint32_t seed) {
     k ^= 0xA5C3F00Du;                                    // 与固定掩码异或
     k = (k << 3) | (k >> 29);                            // 循环左移 3 位
     return k;
+}
+
+void UdsServer::resetDidTable() {
+    dids() = factoryDids();
 }
 
 std::vector<std::uint8_t> UdsServer::handle(const std::vector<std::uint8_t>& req,

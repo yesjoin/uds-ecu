@@ -84,6 +84,10 @@ public:
     // 好处是客户端工具能直接复用它来算密钥。
     static std::uint32_t computeKey(std::uint32_t seed);
 
+    // 把 DID 表恢复成出厂值。DID 表是进程内静态的（写进去要留得住），
+    // 所以跑大批用例前必须先复位，否则前一条用例写坏的值会污染后一条。
+    static void resetDidTable();
+
     Session       session()          const { return m_session; }
     bool          securityUnlocked() const { return m_unlocked; }
     std::size_t   dtcCount()         const { return m_dtcs.size(); }

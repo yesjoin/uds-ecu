@@ -33,3 +33,8 @@ target_link_libraries(uds-selftest PRIVATE Threads::Threads)
 add_executable(uds-demo tools/uds_demo.cpp src/CanBus.cpp src/IsoTp.cpp src/Uds.cpp)
 target_include_directories(uds-demo PRIVATE include)
 target_link_libraries(uds-demo PRIVATE Threads::Threads)
+
+# M5：200 条测试矩阵 + 报告导出（csv / markdown）
+add_executable(uds-matrix tests/uds_matrix.cpp src/Uds.cpp)
+target_include_directories(uds-matrix PRIVATE include)
+target_link_libraries(uds-matrix PRIVATE Threads::Threads)
