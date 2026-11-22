@@ -176,19 +176,168 @@ void testS3Timeout() {
     check(ecu.session() == uds::Session::Extended, "S3：3E 保活后不会误退会话");
 }
 
+// ---------------------------------------------------------------------------
+// M3：0x27 安全访问
+// ---------------------------------------------------------------------------
+std::uint32_t seedOf(const Bytes& r) {
+    return (static_cast<std::uint32_t>(r[2]) << 24) |
+           (static_cast<std::uint32_t>(r[3]) << 16) |
+           (static_cast<std::uint32_t>(r[4]) << 8) |
+            static_cast<std::uint32_t>(r[5]);
+}
+
+Bytes keyReq(std::uint32_t key) {
+    return Bytes{0x27, 0x02,
+                 static_cast<std::uint8_t>((key >> 24) & 0xFF),
+                 static_cast<std::uint8_t>((key >> 16) & 0xFF),
+                 static_cast<std::uint8_t>((key >> 8) & 0xFF),
+                 static_cast<std::uint8_t>(key & 0xFF)};
+}
+
+void testSecurityAccess() {
+    uds::UdsServer ecu;
+
+    // 注意是 0x7F 不是 0x7E：
+    //   0x7E = 子功能不支持，0x7F = 服务不支持。
+    //   整个 0x27 在默认会话都不许用，所以给 7F。
+    expect("0x27：默认会话要种子 → 7F 27 7F",
+           ecu.handle(Bytes{0x27, 0x01}, 0), Bytes{0x7F, 0x27, 0x7F});
+
+    ecu.handle(Bytes{0x10, 0x03}, 100);            // 进扩展会话
+
+    const Bytes sf1 = ecu.handle(Bytes{0x27, 0x01}, 100);
+    check(sf1.size() == 6 && sf1[0] == 0x67 && sf1[1] == 0x01,
+          "0x27：请求种子 → 67 01 + 4 字节种子");
+
+    // 再要一次：种子必须变，否则旧密钥可以重放
+    const Bytes sf2 = ecu.handle(Bytes{0x27, 0x01}, 100);
+    check(sf2.size() == 6 && seedOf(sf1) != seedOf(sf2),
+          "0x27：两次种子不同（防重放）");
+
+    expect("0x27：密钥错 → 7F 27 35",
+           ecu.handle(keyReq(0x00000000u), 100), Bytes{0x7F, 0x27, 0x35});
+
+    expect("0x27：种子作废后再送密钥 → 7F 27 24（顺序错）",
+           ecu.handle(keyReq(0x00000000u), 100), Bytes{0x7F, 0x27, 0x24});
+
+    const Bytes sf3 = ecu.handle(Bytes{0x27, 0x01}, 100);
+    const std::uint32_t key = uds::UdsServer::computeKey(seedOf(sf3));
+    expect("0x27：正确密钥 → 67 02",
+           ecu.handle(keyReq(key), 100), Bytes{0x67, 0x02});
+    check(ecu.securityUnlocked(), "0x27：解锁标志置位");
+
+    expect("0x27：已解锁再要种子 → 全零（不用再解）",
+           ecu.handle(Bytes{0x27, 0x01}, 100),
+           Bytes{0x67, 0x01, 0x00, 0x00, 0x00, 0x00});
+}
+
+void testSecurityLockout() {
+    uds::UdsServer ecu;
+    ecu.handle(Bytes{0x10, 0x03}, 0);
+
+    Bytes last;
+    for (int i = 0; i < 3; ++i) {
+        ecu.handle(Bytes{0x27, 0x01}, 0);                  // 每次都得重新要种子
+        last = ecu.handle(keyReq(0x11111111u), 0);         // 每次都给错的
+    }
+    expect("0x27：连错 3 次 → 7F 27 36（超次数）", last, Bytes{0x7F, 0x27, 0x36});
+
+    expect("0x27：锁定期内要种子 → 7F 27 37",
+           ecu.handle(Bytes{0x27, 0x01}, 500), Bytes{0x7F, 0x27, 0x37});
+
+    check(ecu.handle(Bytes{0x27, 0x01}, 10500).size() == 6,
+          "0x27：冷却 10 秒后可以重新要种子");
+}
+
+// ---------------------------------------------------------------------------
+// M3：受保护 DID 的写入门槛
+// ---------------------------------------------------------------------------
+void testProtectedWrite() {
+    uds::UdsServer ecu;
+    ecu.handle(Bytes{0x10, 0x03}, 0);
+
+    expect("0x2E：里程 DID 未解锁 → 7F 2E 33",
+           ecu.handle(Bytes{0x2E, 0x02, 0x00, 0x00, 0x00, 0x27, 0x10}, 0),
+           Bytes{0x7F, 0x2E, 0x33});
+
+    const Bytes sf = ecu.handle(Bytes{0x27, 0x01}, 0);
+    ecu.handle(keyReq(uds::UdsServer::computeKey(seedOf(sf))), 0);
+
+    expect("0x2E：解锁后写里程 → 6E 02 00",
+           ecu.handle(Bytes{0x2E, 0x02, 0x00, 0x00, 0x00, 0x27, 0x10}, 0),
+           Bytes{0x6E, 0x02, 0x00});
+
+    expect("0x2E：读回里程 = 00 00 27 10（10000）",
+           ecu.handle(Bytes{0x22, 0x02, 0x00}, 0),
+           Bytes{0x62, 0x02, 0x00, 0x00, 0x00, 0x27, 0x10});
+
+    // 切回默认再进扩展：会话回来了，但锁不回来
+    ecu.handle(Bytes{0x10, 0x01}, 0);
+    ecu.handle(Bytes{0x10, 0x03}, 0);
+    expect("0x27：换会话后重新上锁 → 7F 2E 33",
+           ecu.handle(Bytes{0x2E, 0x02, 0x00, 0x00, 0x00, 0x00, 0x10}, 0),
+           Bytes{0x7F, 0x2E, 0x33});
+}
+
+// ---------------------------------------------------------------------------
+// M3：0x19 读故障码 / 0x14 清故障码
+// ---------------------------------------------------------------------------
+void testDtc() {
+    uds::UdsServer ecu;
+
+    expect("0x19：按 0xFF 掩码报数量 = 3 条",
+           ecu.handle(Bytes{0x19, 0x01, 0xFF}, 0),
+           Bytes{0x59, 0x01, 0xFF, 0x01, 0x00, 0x03});
+
+    expect("0x19：列出全部 DTC（码 + 状态）",
+           ecu.handle(Bytes{0x19, 0x02, 0xFF}, 0),
+           Bytes{0x59, 0x02, 0xFF,
+                 0xC1, 0x20, 0x01, 0x09,
+                 0x0A, 0x12, 0x02, 0x08,
+                 0x7A, 0x12, 0x03, 0x01});
+
+    expect("0x19：只查已确认（0x08）→ 2 条",
+           ecu.handle(Bytes{0x19, 0x02, 0x08}, 0),
+           Bytes{0x59, 0x02, 0xFF,
+                 0xC1, 0x20, 0x01, 0x09,
+                 0x0A, 0x12, 0x02, 0x08});
+
+    expect("0x19：数量也按 0x08 过滤 = 2",
+           ecu.handle(Bytes{0x19, 0x01, 0x08}, 0),
+           Bytes{0x59, 0x01, 0xFF, 0x01, 0x00, 0x02});
+
+    expect("0x14：清全部 → 54",
+           ecu.handle(Bytes{0x14, 0xFF, 0xFF, 0xFF}, 0), Bytes{0x54});
+    check(ecu.dtcCount() == 0, "0x14：清完之后故障码表空了");
+
+    expect("0x19：清完再查数量 = 0",
+           ecu.handle(Bytes{0x19, 0x01, 0xFF}, 0),
+           Bytes{0x59, 0x01, 0xFF, 0x01, 0x00, 0x00});
+
+    expect("0x19：清完后列表只剩表头",
+           ecu.handle(Bytes{0x19, 0x02, 0xFF}, 0), Bytes{0x59, 0x02, 0xFF});
+
+    expect("0x19：子功能 0x03 不支持 → 7F 19 12",
+           ecu.handle(Bytes{0x19, 0x03, 0xFF}, 0), Bytes{0x7F, 0x19, 0x12});
+}
+
 } // namespace
 
 int main() {
-    std::printf("=== UDS 服务层自测（M2）===\n\n");
+    std::printf("=== UDS 服务层自测（M2 + M3）===\n\n");
 
     testSessionControl();
     testReadDid();
     testWriteDid();
     testTesterPresent();
     testS3Timeout();
+    testSecurityAccess();
+    testSecurityLockout();
+    testProtectedWrite();
+    testDtc();
 
     std::printf("\n--------------------------------\n");
     std::printf("通过 %d 项，失败 %d 项\n", gPass, gFail);
-    if (gFail == 0) std::printf("M2 服务层全绿 —— 可以接总线给真实客户端答话了。\n");
+    if (gFail == 0) std::printf("M3 全绿 —— 服务层从能读能写，进到有门槛了。\n");
     return (gFail == 0) ? 0 : 1;
 }
