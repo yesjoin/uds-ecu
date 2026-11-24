@@ -140,7 +140,9 @@ std::vector<Case> g_cases;
 std::size_t add(const char* svc, const char* cat, const char* desc,
                 Prep prep, Kind kind, Bytes req, Bytes expect = Bytes{}) {
     Case c;
-    char id[16];
+    // 32 而不是 16：%zu 是 size_t，最坏情况能打 20 位数字，"M-" + 3 位补零 + 20 位
+    // 塞不进 16；gcc 15 的 -Wformat-truncation 会直接把它当错误（-Werror 下编不过）
+    char id[32];
     std::snprintf(id, sizeof(id), "M-%03zu", g_cases.size() + 1);
     c.id     = id;
     c.svc    = svc;
