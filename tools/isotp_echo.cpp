@@ -46,14 +46,6 @@ std::uint8_t checksum(const std::vector<std::uint8_t>& v) {
     return static_cast<std::uint8_t>(s & 0xFF);
 }
 
-void dumpFrame(const char* tag, const uds::Frame& f) {
-    std::printf("  %s id=0x%03X dlc=%u  ", tag, f.id, static_cast<unsigned>(f.dlc));
-    for (std::uint8_t i = 0; i < f.dlc; ++i) {
-        std::printf("%02X ", f.data[i]);
-    }
-    std::printf("\n");
-}
-
 // 睡到指定时刻。
 //
 // sleep_for 在虚拟机里粒度约 15ms：请求 10ms 实际睡 15ms。
