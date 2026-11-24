@@ -1,0 +1,107 @@
+# =============================================================================
+# ci.yml —— uds-ecu 的持续集成
+#
+# 两个 job：
+#   ① build-test  构建 + 3 个自测套件（gcc 带 -Werror，clang 只查可移植性）
+#   ② bus-e2e     在真 vcan0 上跑一次完整对话（内核没有 vcan 模块就跳过，不算失败）
+#
+# 约定：
+#   - 干净环境：每次全新 checkout，没有残留的 build/
+#   - 参数一致：和 tools/ci_local.sh 同一套 cmake 参数，所以"本地绿 ≈ CI 绿"
+#   - 加了 -O2：有的警告只在优化后才出现，只跑 Debug 等于把它们留给用户
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # ① 构建 + 单元测试
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: 构建 + 自测（${{ matrix.compiler }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # 一条腿红了不掐掉另一条：两个编译器的结论都有用
+      matrix:
+        include:
+          - compiler: gcc
+            werror: ON        # 主腿：警告当错误，守护"零警告"
+          - compiler: clang
+            werror: OFF       # 副腿：只验证能编、测试能过（可移植性）
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 记录环境（红了先看这段）
+        run: |
+          echo "### ${{ matrix.compiler }} / -Werror=${{ matrix.werror }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ${{ matrix.compiler }} --version | head -1 | tee -a "$GITHUB_STEP_SUMMARY"
+          cmake --version | head -1 | tee -a "$GITHUB_STEP_SUMMARY"
+          uname -srm | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 配置
+        env:
+          CC: ${{ matrix.compiler }}
+          CXX: ${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-O2 -DUDS_WERROR=${{ matrix.werror }}
+
+      - name: 构建
+        run: cmake --build build -j"$(nproc)"
+
+      - name: 自测（ctest：ISO-TP 41 + UDS 77 + 矩阵 200）
+        run: cd build && ctest --output-on-failure
+
+      - name: 产物冒烟（确认可执行文件真的能跑）
+        run: |
+          ./build/isotp-selftest | tail -1
+          ./build/uds-selftest   | tail -1
+          cd build && ./uds-matrix | tail -3 && ls test_matrix.csv test_matrix_report.md
+
+  # ---------------------------------------------------------------------------
+  # ② 真总线端到端（需要 vcan 内核模块 + sudo）
+  # ---------------------------------------------------------------------------
+  bus-e2e:
+    name: 真 vcan0 端到端（ECU ↔ 诊断仪）
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 尝试建 vcan0（没有模块就跳过）
+        id: vcan
+        run: |
+          if sudo modprobe vcan 2>/dev/null && sudo ip link add dev vcan0 type vcan 2>/dev/null; then
+            sudo ip link set up vcan0
+            echo "have=1" >> "$GITHUB_OUTPUT"
+            echo "vcan0 就绪" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "have=0" >> "$GITHUB_OUTPUT"
+            echo "这台 runner 没有 vcan 模块，跳过真总线步骤（不算失败）" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 构建
+        if: steps.vcan.outputs.have == '1'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-O2 -DUDS_WERROR=ON
+          cmake --build build -j"$(nproc)"
+
+      - name: 端到端：读 VIN（20 字节，必须走多帧）
+        if: steps.vcan.outputs.have == '1'
+        run: bash tools/e2e_check.sh vcan0
+
+      - name: 上传测试矩阵（作为产物留档）
+        if: always() && steps.vcan.outputs.have == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-matrix
+          path: |
+            build/test_matrix.csv
+            build/test_matrix_report.md
+          if-no-files-found: warn

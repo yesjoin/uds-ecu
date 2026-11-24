@@ -7,6 +7,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# 把警告当错误开关：CI 的 gcc 腿打开它，本地默认关（改代码时先别被警告挡住）
+option(UDS_WERROR "Treat warnings as errors" OFF)
+if(UDS_WERROR)
+    add_compile_options(-Werror)
+endif()
+
 find_package(Threads REQUIRED)
 
 # M0：SocketCAN 收帧 + 收发解耦
@@ -38,3 +44,13 @@ target_link_libraries(uds-demo PRIVATE Threads::Threads)
 add_executable(uds-matrix tests/uds_matrix.cpp src/Uds.cpp)
 target_include_directories(uds-matrix PRIVATE include)
 target_link_libraries(uds-matrix PRIVATE Threads::Threads)
+
+# ---------------------------------------------------------------------------
+# 自测登记：三个套件都是纯内存测试（不碰 vcan），所以 `ctest` 在任何机器上都能跑。
+# 真总线的验证（isotp-echo / uds-demo）不是 ctest，是 tools/ 下的端到端脚本 ——
+# 需要 sudo 建 vcan0，属于"环境依赖"，不该混进单元测试。
+# ---------------------------------------------------------------------------
+enable_testing()
+add_test(NAME isotp-selftest COMMAND isotp-selftest)
+add_test(NAME uds-selftest   COMMAND uds-selftest)
+add_test(NAME uds-matrix     COMMAND uds-matrix)
